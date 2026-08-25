@@ -1,0 +1,176 @@
+# Alphaca Java: the same chief-staff-engineer role as `alphaca`, with a JVM
+# toolchain instead of a Rust one. Install it by the commit you want:
+#
+#   wormhole role add \
+#       git@github.com:naborka/wormhole-alphaca-java@<commit sha> \
+#       --as alphaca-java
+#
+# then, in any workspace (`--role` beats the workspace's own manifest):
+#
+#   wormhole box --role alphaca-java
+#
+# ROLE.md repeats alphaca's persona because a manifest names one
+# instructions file and wormhole cannot compose two.
+
+version = 1
+name = "Alphaca Java"
+
+# Everything the image is made of, and nothing else. Change a line in here
+# and the next `wormhole build` builds; change one anywhere else and it
+# does not.
+[image]
+base = "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-minirootfs-3.22.2-x86_64.tar.gz"
+base_sha256 = "412454ed98025ad9cd910d13f3d448b184e81502baa83180e89f98d0f13674be"
+
+# http on purpose: a fresh rootfs has no CA store, and apk verifies every
+# index and package against the signing keys it ships.
+package_sources = [
+  "http://dl-cdn.alpinelinux.org/alpine/v3.22/main",
+  "http://dl-cdn.alpinelinux.org/alpine/v3.22/community",
+]
+
+packages = [
+  "bash",
+  "nodejs",
+  "npm",
+  "git",
+  "openssh-client",
+  "ca-certificates",
+  # Two LTS toolchains, not one. Gradle's `jvmToolchain(N)` needs that exact
+  # JDK on disk and finds them by scanning /usr/lib/jvm; the ones it
+  # downloads itself are glibc builds that cannot run on this musl box. 21
+  # becomes the default JVM, 17 is there for projects that pin it.
+  "openjdk21-jdk",
+  "openjdk17-jdk",
+  # For projects with no wrapper, and for `gradle wrapper`. A project with
+  # ./gradlew uses that — the version it was written against.
+  "gradle",
+  "maven",
+  "unzip", # the language server below arrives as a zip
+  # Modern tools, called by name: a non-interactive shell reads no aliases.
+  "ripgrep", # grep
+  "fd",      # find
+  "eza",     # ls
+  "btop",    # top
+  "ncdu",    # du
+]
+
+build = [
+  "npm install -g @anthropic-ai/claude-code",
+  # RTK, prebuilt musl binary. Not `cargo install`: that needs crates.io,
+  # which some networks intercept with their own CA. GitHub passes clean,
+  # and the pinned digest verifies the bytes whatever the channel.
+  # /usr/local/bin is on every shell's default PATH; ~/.cargo/bin is not on
+  # the /bin/sh subshells Claude Code spawns for hooks.
+  "wget -qO /tmp/rtk.tar.gz https://github.com/rtk-ai/rtk/releases/download/v0.45.0/rtk-x86_64-unknown-linux-musl.tar.gz",
+  "echo 'c4c036fbf181fc55ef329786c8c17e0d427972b053b825944d968a6aafef1ba4  /tmp/rtk.tar.gz' | sha256sum -c -",
+  "tar -xzf /tmp/rtk.tar.gz -C /usr/local/bin rtk",
+  "rm /tmp/rtk.tar.gz",
+  # Eclipse JDT.LS, from a vscode-java release rather than upstream:
+  # upstream publishes only dated snapshots and prunes the old ones, so a
+  # pinned upstream URL stops resolving and this role stops building. The
+  # platform-independent .vsix carries no runtime, so it uses the box's JDK.
+  "wget -qO /tmp/jdtls.vsix https://github.com/redhat-developer/vscode-java/releases/download/v1.55.0/vscode-java-1.55.0-995.vsix",
+  "echo '011639c3ee347b9591895bfc77d8cf28f836c053d0a49ae4a83efe9dc473a603  /tmp/jdtls.vsix' | sha256sum -c -",
+  "unzip -q /tmp/jdtls.vsix 'extension/server/*' -d /tmp/jdtls",
+  "mkdir -p /opt",
+  "mv /tmp/jdtls/extension/server /opt/jdtls",
+  "rm -rf /tmp/jdtls /tmp/jdtls.vsix",
+  # The plugin starts `jdtls` with no arguments, so every argument is
+  # decided here. Eclipse writes into both the configuration and the data
+  # directory, so both sit in the kept home — one per workspace, so the next
+  # box reuses the index this one built.
+  '''
+cat > /usr/local/bin/jdtls <<'EOF'
+#!/bin/sh
+set -eu
+
+state="$HOME/.cache/jdtls"
+if [ ! -d "$state/config" ]; then
+    mkdir -p "$state"
+    cp -r /opt/jdtls/config_linux "$state/config"
+fi
+
+set -- /opt/jdtls/plugins/org.eclipse.equinox.launcher_*.jar
+exec java \
+    -Declipse.application=org.eclipse.jdt.ls.core.id1 \
+    -Declipse.product=org.eclipse.jdt.ls.core.product \
+    -Dosgi.bundles.defaultStartLevel=4 \
+    -Dlog.level=ERROR \
+    -Xmx2G \
+    --add-modules=ALL-SYSTEM \
+    --add-opens java.base/java.util=ALL-UNNAMED \
+    --add-opens java.base/java.lang=ALL-UNNAMED \
+    -jar "$1" \
+    -configuration "$state/config" \
+    -data "$state/workspace"
+EOF
+chmod +x /usr/local/bin/jdtls
+''',
+]
+
+[agent]
+run = "claude"
+model = "claude-fable-5"
+# Both paths resolve against this directory, so the role is self-contained.
+instructions = "ROLE.md"
+preflight = "hooks/preflight.sh"
+
+# What the box can reach. Everything unnamed here is invisible to it.
+[access]
+# The credential file alone, not all of `~/.claude`: that directory's hooks
+# call host tools this box does not have.
+grants = ["~/.claude/.credentials.json", "~/.ssh"]
+# Change if you are on a VPN or split DNS. To take the route away entirely,
+# set `network = "none"` and `broker = true`, then drop this line and the
+# credentials grant: the box reaches the API through `wormhole broker`.
+dns = "1.1.1.1"
+# Some networks intercept TLS (Maven Central and plugins.gradle.org here)
+# with their own CA, and the box's fresh store rightly refuses it. This
+# mounts the host's bundle over the box's, so the box trusts what the host
+# trusts and no more. Java reads a keystore, not this bundle; the preflight
+# hook rebuilds that keystore from it.
+host_ca = true
+
+# The box's whole environment. `default` lets the host's value win when it
+# has one; `fixed` ignores the host, for anything that describes the box.
+[env.ANTHROPIC_API_KEY]
+default = ""
+
+# The caveman plugin's highest-priority mode source, above any config file.
+[env.CAVEMAN_DEFAULT_MODE]
+fixed = "ultra"
+
+[env.CONTEXT7_API_KEY]
+default = ""
+
+# Wormhole carries your terminal's own description into the box home on
+# every start, so your real TERM wins here. This is what the box is told
+# when there was no description to carry.
+[env.TERM]
+default = "xterm-256color"
+
+# What TERM does not say. Neither needs a terminfo entry.
+[env.COLORTERM]
+default = ""
+
+[env.TERM_PROGRAM]
+default = ""
+
+[env.TERM_PROGRAM_VERSION]
+default = ""
+
+# Claude Code dies without one, and it must exist inside the box.
+[env.SHELL]
+fixed = "/bin/bash"
+
+# The symlink java-common keeps pointing at the highest installed JDK, so
+# this needs no edit when the JDK list changes.
+[env.JAVA_HOME]
+fixed = "/usr/lib/jvm/default-jvm"
+
+# Without a locale a JDK asks the C library for the platform encoding and
+# can be told US-ASCII, which turns every non-ASCII string in a test into a
+# mystery.
+[env.LANG]
+fixed = "C.UTF-8"
